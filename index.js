@@ -14,24 +14,42 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 // Calling getUpdates with timeout=0 instantly drains any queued updates
 // from crash/restart cycles without processing them, preventing 429 floods.
 async function clearPendingUpdates(bot) {
+  const deadline = Date.now() + 60_000; // give up after 60s no matter what
   let offset = 0;
   let totalCleared = 0;
-  try {
-    while (true) {
-      const updates = await bot.telegram.getUpdates({ offset, timeout: 1, limit: 100 });
-      if (updates.length === 0) break;
-      
+
+  console.log('[Telegram] 🧹 Clearing stale updates...');
+
+  while (Date.now() < deadline) {
+    try {
+      // Race the getUpdates call against a 6-second timeout so it never hangs
+      const updates = await Promise.race([
+        bot.telegram.getUpdates({ offset, timeout: 1, limit: 100 }),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('FETCH_TIMEOUT')), 6000)),
+      ]);
+
+      if (updates.length === 0) break; // queue is empty — done
+
       offset = updates[updates.length - 1].update_id + 1;
       totalCleared += updates.length;
+
+    } catch (err) {
+      const is409 = err?.response?.error_code === 409 || String(err.message).includes('409');
+
+      if (is409) {
+        // Old Railway container is still alive — wait for it to die
+        console.log('[Telegram] ⏳ Old container still running, retrying in 5s...');
+        await sleep(5000);
+      } else {
+        // Network hiccup or timeout — just start polling from offset 0
+        console.log('[Telegram] ⚠️  Could not clear updates:', err.message);
+        break;
+      }
     }
-    if (totalCleared > 0) {
-      console.log(`[Telegram] 🗑  Cleared ${totalCleared} stale update(s).`);
-    }
-    return offset;
-  } catch (err) {
-    console.log('[Telegram] Could not clear pending updates:', err.message);
   }
-  return 0;
+
+  if (totalCleared > 0) console.log(`[Telegram] 🗑  Cleared ${totalCleared} stale update(s).`);
+  return offset;
 }
 
 // ── Manual polling loop — replaces bot.launch() ───────────────────────────────
