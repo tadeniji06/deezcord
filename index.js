@@ -18,7 +18,7 @@ async function clearPendingUpdates(bot) {
   let totalCleared = 0;
   try {
     while (true) {
-      const updates = await bot.telegram.getUpdates({ offset, timeout: 0, limit: 100 });
+      const updates = await bot.telegram.getUpdates({ offset, timeout: 1, limit: 100 });
       if (updates.length === 0) break;
       
       offset = updates[updates.length - 1].update_id + 1;
@@ -84,6 +84,17 @@ async function main() {
 
   // Start polling in the background (never awaited — runs forever)
   startPolling(bot);
+
+  // ── Dummy Web Server for Railway Health Checks ──────────────────────────────
+  // Railway expects the app to bind to a PORT, otherwise it marks it as crashed
+  const http = require('http');
+  const PORT = process.env.PORT || 3000;
+  http.createServer((req, res) => {
+    res.writeHead(200);
+    res.end('DeeZcord Bot is running.');
+  }).listen(PORT, () => {
+    console.log(`[Startup] 🌐 Web server listening on port ${PORT} (Health check)`);
+  });
 
   process.once('SIGINT',  () => { console.log('\n[Shutdown] Bye!'); process.exit(0); });
   process.once('SIGTERM', () => { console.log('\n[Shutdown] Bye!'); process.exit(0); });
