@@ -10,53 +10,26 @@ const { startSimulator } = require('./simulator');
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// ── Clear stale updates from previous sessions ───────────────────────────────
-// Calling getUpdates with timeout=0 instantly drains any queued updates
-// from crash/restart cycles without processing them, preventing 429 floods.
-async function clearPendingUpdates(bot) {
-  const deadline = Date.now() + 60_000; // give up after 60s no matter what
-  let offset = 0;
-  let totalCleared = 0;
-
-  console.log('[Telegram] 🧹 Clearing stale updates...');
-
-  while (Date.now() < deadline) {
-    try {
-      // Race the getUpdates call against a 6-second timeout so it never hangs
-      const updates = await Promise.race([
-        bot.telegram.getUpdates({ offset, timeout: 1, limit: 100 }),
-        new Promise((_, rej) => setTimeout(() => rej(new Error('FETCH_TIMEOUT')), 6000)),
-      ]);
-
-      if (updates.length === 0) break; // queue is empty — done
-
-      offset = updates[updates.length - 1].update_id + 1;
-      totalCleared += updates.length;
-
-    } catch (err) {
-      const is409 = err?.response?.error_code === 409 || String(err.message).includes('409');
-
-      if (is409) {
-        // Old Railway container is still alive — wait for it to die
-        console.log('[Telegram] ⏳ Old container still running, retrying in 5s...');
-        await sleep(5000);
-      } else {
-        // Network hiccup or timeout — just start polling from offset 0
-        console.log('[Telegram] ⚠️  Could not clear updates:', err.message);
-        break;
-      }
-    }
+// ── Drop all pending updates (single atomic API call) ─────────────────────────
+// deleteWebhook with drop_pending_updates=true tells Telegram to wipe its
+// entire update queue instantly. Much safer than draining with getUpdates,
+// which can hang when another instance is still holding the polling connection.
+async function dropPendingUpdates(bot) {
+  try {
+    await bot.telegram.deleteWebhook({ drop_pending_updates: true });
+    console.log('[Telegram] 🗑  Pending updates dropped.');
+  } catch (err) {
+    // Non-fatal — just log and continue. Stale updates will be filtered below.
+    console.log('[Telegram] ⚠️  Could not drop updates:', err.message);
   }
-
-  if (totalCleared > 0) console.log(`[Telegram] 🗑  Cleared ${totalCleared} stale update(s).`);
-  return offset;
 }
 
-// ── Manual polling loop — replaces bot.launch() ───────────────────────────────
-// This gives us direct control over 409 conflicts and network errors,
-// instead of relying on Telegraf's internal loop which hangs silently.
+// ── Manual polling loop ───────────────────────────────────────────────────────
 async function startPolling(bot) {
-  let offset = await clearPendingUpdates(bot);
+  // Drop any stale updates BEFORE we start receiving new ones
+  await dropPendingUpdates(bot);
+
+  let offset = 0;
   console.log('[Telegram] 🔄 Polling started.');
 
   while (true) {
@@ -69,6 +42,20 @@ async function startPolling(bot) {
 
       for (const update of updates) {
         offset = update.update_id + 1;
+
+        // ── Stale-update guard ───────────────────────────────────────────────
+        // Skip any update whose message/callback is older than 60 seconds.
+        // This is a safety net against updates that slip through the drop call
+        // (e.g. during zero-downtime Railway deploys with two containers racing).
+        const msgDate =
+          update.message?.date ||
+          update.edited_message?.date ||
+          update.callback_query?.message?.date ||
+          0;
+        if (msgDate && (Date.now() / 1000 - msgDate) > 60) {
+          continue; // silently discard — no log spam
+        }
+
         bot.handleUpdate(update).catch(err =>
           console.error('[Telegram] Update error:', err.message)
         );
@@ -93,25 +80,22 @@ async function main() {
 
   const { bot, sendNotificationToChat } = buildBot();
 
-  // Fetch bot info once (required for Telegraf to process updates correctly)
   bot.botInfo = await bot.telegram.getMe();
   console.log(`[Startup] ✅ Connected as @${bot.botInfo.username}`);
 
-  // Start the fake-join simulator
   startSimulator(sendNotificationToChat);
 
-  // Start polling in the background (never awaited — runs forever)
+  // Not awaited — runs forever in the background
   startPolling(bot);
 
-  // ── Dummy Web Server for Railway Health Checks ──────────────────────────────
-  // Railway expects the app to bind to a PORT, otherwise it marks it as crashed
+  // Railway requires a bound PORT for health checks
   const http = require('http');
   const PORT = process.env.PORT || 3000;
   http.createServer((req, res) => {
     res.writeHead(200);
-    res.end('DeeZcord Bot is running.');
+    res.end('DeeZcord is running.');
   }).listen(PORT, () => {
-    console.log(`[Startup] 🌐 Web server listening on port ${PORT} (Health check)`);
+    console.log(`[Startup] 🌐 Health-check server on port ${PORT}`);
   });
 
   process.once('SIGINT',  () => { console.log('\n[Shutdown] Bye!'); process.exit(0); });
